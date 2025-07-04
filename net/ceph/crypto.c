@@ -37,8 +37,10 @@ static int set_secret(struct ceph_crypto_key *key, void *buf)
 		return -ENOTSUPP;
 	}
 
-	if (!key->len)
+	if (key->len > CEPH_MAX_KEY_LEN) {
+		pr_err("secret too big %d\n", key->len);
 		return -EINVAL;
+	}
 
 	key->key = kmemdup(buf, key->len, GFP_NOIO);
 	if (!key->key) {
