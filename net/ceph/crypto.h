@@ -5,7 +5,7 @@
 #include <linux/ceph/types.h>
 #include <linux/ceph/buffer.h>
 
-#define CEPH_MAX_KEY_LEN		16
+#define CEPH_MAX_KEY_LEN		32
 #define CEPH_MAX_CON_SECRET_LEN		64
 
 /*
@@ -16,7 +16,13 @@ struct ceph_crypto_key {
 	struct ceph_timespec created;
 	int len;
 	void *key;
-	struct crypto_sync_skcipher *tfm;
+	union {
+		struct crypto_sync_skcipher *aes_tfm;
+		struct {
+			const struct krb5_enctype *krb5_type;
+			struct crypto_aead *krb5_tfm;
+		};
+	};
 };
 
 int ceph_crypto_key_clone(struct ceph_crypto_key *dst,

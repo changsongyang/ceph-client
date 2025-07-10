@@ -7,6 +7,7 @@
 #include <linux/sched.h>
 #include <linux/slab.h>
 #include <crypto/aes.h>
+#include <crypto/krb5.h>
 #include <crypto/skcipher.h>
 #include <linux/key-type.h>
 #include <linux/sched/mm.h>
@@ -16,22 +17,73 @@
 #include <linux/ceph/decode.h>
 #include "crypto.h"
 
-/*
- * Set ->key and ->tfm.  The rest of the key should be filled in before
- * this function is called.
- */
-static int set_secret(struct ceph_crypto_key *key, void *buf)
+static int set_aes_tfm(struct ceph_crypto_key *key)
 {
 	unsigned int noio_flag;
 	int ret;
 
+	noio_flag = memalloc_noio_save();
+	key->aes_tfm = crypto_alloc_sync_skcipher("cbc(aes)", 0, 0);
+	memalloc_noio_restore(noio_flag);
+	if (IS_ERR(key->aes_tfm)) {
+		ret = PTR_ERR(key->aes_tfm);
+		key->aes_tfm = NULL;
+		return ret;
+	}
+
+	ret = crypto_sync_skcipher_setkey(key->aes_tfm, key->key, key->len);
+	if (ret)
+		return ret;
+
+	return 0;
+}
+
+static int set_krb5_tfm(struct ceph_crypto_key *key)
+{
+	struct krb5_buffer TK = { .len = key->len, .data = key->key };
+	unsigned int noio_flag;
+	int ret;
+
+	key->krb5_type = crypto_krb5_find_enctype(
+				    KRB5_ENCTYPE_AES256_CTS_HMAC_SHA384_192);
+	if (!key->krb5_type)
+		return -ENOPKG;
+
+	/*
+	 * Despite crypto_krb5_prepare_encryption() taking a gfp mask,
+	 * crypto_alloc_aead() inside of it allocates with GFP_KERNEL.
+	 */
+	noio_flag = memalloc_noio_save();
+	key->krb5_tfm = crypto_krb5_prepare_encryption(key->krb5_type, &TK,
+						       0 /* key usage value */,
+						       GFP_NOIO);
+	memalloc_noio_restore(noio_flag);
+	if (IS_ERR(key->krb5_tfm)) {
+		ret = PTR_ERR(key->krb5_tfm);
+		key->krb5_tfm = NULL;
+		return ret;
+	}
+
+	return 0;
+}
+
+/*
+ * Set ->key and tfm contexts.  The rest of the key should be filled in
+ * before this function is called.
+ */
+static int set_secret(struct ceph_crypto_key *key, void *buf)
+{
+	int ret;
+
 	key->key = NULL;
-	key->tfm = NULL;
+	key->aes_tfm = NULL;
+	key->krb5_tfm = NULL;
 
 	switch (key->type) {
 	case CEPH_CRYPTO_NONE:
 		return 0; /* nothing to do */
 	case CEPH_CRYPTO_AES:
+	case CEPH_CRYPTO_AES256KRB5:
 		break;
 	default:
 		return -ENOTSUPP;
@@ -48,17 +100,8 @@ static int set_secret(struct ceph_crypto_key *key, void *buf)
 		goto fail;
 	}
 
-	/* crypto_alloc_sync_skcipher() allocates with GFP_KERNEL */
-	noio_flag = memalloc_noio_save();
-	key->tfm = crypto_alloc_sync_skcipher("cbc(aes)", 0, 0);
-	memalloc_noio_restore(noio_flag);
-	if (IS_ERR(key->tfm)) {
-		ret = PTR_ERR(key->tfm);
-		key->tfm = NULL;
-		goto fail;
-	}
-
-	ret = crypto_sync_skcipher_setkey(key->tfm, key->key, key->len);
+	ret = (key->type == CEPH_CRYPTO_AES) ? set_aes_tfm(key) :
+					       set_krb5_tfm(key);
 	if (ret)
 		goto fail;
 
@@ -127,9 +170,16 @@ void ceph_crypto_key_destroy(struct ceph_crypto_key *key)
 	if (key) {
 		kfree_sensitive(key->key);
 		key->key = NULL;
-		if (key->tfm) {
-			crypto_free_sync_skcipher(key->tfm);
-			key->tfm = NULL;
+		if (key->type == CEPH_CRYPTO_AES) {
+			if (key->aes_tfm) {
+				crypto_free_sync_skcipher(key->aes_tfm);
+				key->aes_tfm = NULL;
+			}
+		} else {
+			if (key->krb5_tfm) {
+				crypto_free_aead(key->krb5_tfm);
+				key->krb5_tfm = NULL;
+			}
 		}
 	}
 }
@@ -209,7 +259,7 @@ static void teardown_sgtable(struct sg_table *sgt)
 static int ceph_aes_crypt(const struct ceph_crypto_key *key, bool encrypt,
 			  void *buf, int buf_len, int in_len, int *pout_len)
 {
-	SYNC_SKCIPHER_REQUEST_ON_STACK(req, key->tfm);
+	SYNC_SKCIPHER_REQUEST_ON_STACK(req, key->aes_tfm);
 	struct sg_table sgt;
 	struct scatterlist prealloc_sg;
 	char iv[AES_BLOCK_SIZE] __aligned(8);
@@ -225,7 +275,7 @@ static int ceph_aes_crypt(const struct ceph_crypto_key *key, bool encrypt,
 		return ret;
 
 	memcpy(iv, aes_iv, AES_BLOCK_SIZE);
-	skcipher_request_set_sync_tfm(req, key->tfm);
+	skcipher_request_set_sync_tfm(req, key->aes_tfm);
 	skcipher_request_set_callback(req, 0, NULL, NULL);
 	skcipher_request_set_crypt(req, sgt.sgl, sgt.sgl, crypt_len, iv);
 
@@ -270,6 +320,61 @@ out_sgt:
 	return ret;
 }
 
+static int ceph_krb5_encrypt(const struct ceph_crypto_key *key, void *buf,
+			     int buf_len, int in_len, int *pout_len)
+{
+	struct sg_table sgt;
+	struct scatterlist prealloc_sg;
+	int ret;
+
+	ret = setup_sgtable(&sgt, &prealloc_sg, buf, buf_len);
+	if (ret)
+		return ret;
+
+	ret = crypto_krb5_encrypt(key->krb5_type, key->krb5_tfm, sgt.sgl,
+				  sgt.nents, buf_len, AES_BLOCK_SIZE, in_len,
+				  false);
+	if (ret < 0) {
+		pr_err("%s encrypt failed: %d\n", __func__, ret);
+		goto out_sgt;
+	}
+
+	*pout_len = ret;
+	ret = 0;
+
+out_sgt:
+	teardown_sgtable(&sgt);
+	return ret;
+}
+
+static int ceph_krb5_decrypt(const struct ceph_crypto_key *key, void *buf,
+			     int buf_len, int in_len, int *pout_len)
+{
+	struct sg_table sgt;
+	struct scatterlist prealloc_sg;
+	size_t data_off = 0;
+	size_t data_len = in_len;
+	int ret;
+
+	ret = setup_sgtable(&sgt, &prealloc_sg, buf, in_len);
+	if (ret)
+		return ret;
+
+	ret = crypto_krb5_decrypt(key->krb5_type, key->krb5_tfm, sgt.sgl,
+				  sgt.nents, &data_off, &data_len);
+	if (ret) {
+		pr_err("%s decrypt failed: %d\n", __func__, ret);
+		goto out_sgt;
+	}
+
+	WARN_ON(data_off != AES_BLOCK_SIZE);
+	*pout_len = data_len;
+
+out_sgt:
+	teardown_sgtable(&sgt);
+	return ret;
+}
+
 int ceph_crypt(const struct ceph_crypto_key *key, bool encrypt,
 	       void *buf, int buf_len, int in_len, int *pout_len)
 {
@@ -280,6 +385,10 @@ int ceph_crypt(const struct ceph_crypto_key *key, bool encrypt,
 	case CEPH_CRYPTO_AES:
 		return ceph_aes_crypt(key, encrypt, buf, buf_len, in_len,
 				      pout_len);
+	case CEPH_CRYPTO_AES256KRB5:
+		return encrypt ?
+		    ceph_krb5_encrypt(key, buf, buf_len, in_len, pout_len) :
+		    ceph_krb5_decrypt(key, buf, buf_len, in_len, pout_len);
 	default:
 		return -ENOTSUPP;
 	}
@@ -291,6 +400,9 @@ int ceph_crypt_data_offset(const struct ceph_crypto_key *key)
 	case CEPH_CRYPTO_NONE:
 	case CEPH_CRYPTO_AES:
 		return 0;
+	case CEPH_CRYPTO_AES256KRB5:
+		/* confounder */
+		return AES_BLOCK_SIZE;
 	default:
 		BUG();
 	}
@@ -305,6 +417,9 @@ int ceph_crypt_buflen(const struct ceph_crypto_key *key, int data_len)
 		/* PKCS#7 padding at the end */
 		return data_len + AES_BLOCK_SIZE -
 		       (data_len & (AES_BLOCK_SIZE - 1));
+	case CEPH_CRYPTO_AES256KRB5:
+		/* confounder at the beginning and 192-bit HMAC at the end */
+		return AES_BLOCK_SIZE + data_len + 24;
 	default:
 		BUG();
 	}

@@ -57,6 +57,7 @@ static int ceph_x_encrypt_offset(const struct ceph_crypto_key *secret)
 
 /*
  * AES: ciphertext_len | hdr | data... | padding
+ * AES256KRB5: ciphertext_len | confounder | hdr | data... | hmac
  */
 static int ceph_x_encrypt_buflen(const struct ceph_crypto_key *secret,
 				 int data_len)
