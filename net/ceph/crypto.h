@@ -23,6 +23,7 @@ struct ceph_crypto_key {
 			struct crypto_aead *krb5_tfm;
 		};
 	};
+	struct crypto_shash *hmac_tfm;
 };
 
 int ceph_crypto_key_clone(struct ceph_crypto_key *dst,
@@ -36,6 +37,8 @@ int ceph_crypt(const struct ceph_crypto_key *key, bool encrypt,
 	       void *buf, int buf_len, int in_len, int *pout_len);
 int ceph_crypt_data_offset(const struct ceph_crypto_key *key);
 int ceph_crypt_buflen(const struct ceph_crypto_key *key, int data_len);
+int ceph_hmac_sha256(const struct ceph_crypto_key *key, const void *buf,
+		     int buf_len, u8 *hmac);
 int ceph_crypto_init(void);
 void ceph_crypto_shutdown(void);
 

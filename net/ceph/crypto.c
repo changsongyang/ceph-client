@@ -7,7 +7,9 @@
 #include <linux/sched.h>
 #include <linux/slab.h>
 #include <crypto/aes.h>
+#include <crypto/hash.h>
 #include <crypto/krb5.h>
+#include <crypto/sha2.h>
 #include <crypto/skcipher.h>
 #include <linux/key-type.h>
 #include <linux/sched/mm.h>
@@ -73,11 +75,13 @@ static int set_krb5_tfm(struct ceph_crypto_key *key)
  */
 static int set_secret(struct ceph_crypto_key *key, void *buf)
 {
+	unsigned int noio_flag;
 	int ret;
 
 	key->key = NULL;
 	key->aes_tfm = NULL;
 	key->krb5_tfm = NULL;
+	key->hmac_tfm = NULL;
 
 	switch (key->type) {
 	case CEPH_CRYPTO_NONE:
@@ -102,6 +106,19 @@ static int set_secret(struct ceph_crypto_key *key, void *buf)
 
 	ret = (key->type == CEPH_CRYPTO_AES) ? set_aes_tfm(key) :
 					       set_krb5_tfm(key);
+	if (ret)
+		goto fail;
+
+	noio_flag = memalloc_noio_save();
+	key->hmac_tfm = crypto_alloc_shash("hmac(sha256)", 0, 0);
+	memalloc_noio_restore(noio_flag);
+	if (IS_ERR(key->hmac_tfm)) {
+		ret = PTR_ERR(key->hmac_tfm);
+		key->hmac_tfm = NULL;
+		goto fail;
+	}
+
+	ret = crypto_shash_setkey(key->hmac_tfm, key->key, key->len);
 	if (ret)
 		goto fail;
 
@@ -180,6 +197,10 @@ void ceph_crypto_key_destroy(struct ceph_crypto_key *key)
 				crypto_free_aead(key->krb5_tfm);
 				key->krb5_tfm = NULL;
 			}
+		}
+		if (key->hmac_tfm) {
+			crypto_free_shash(key->hmac_tfm);
+			key->hmac_tfm = NULL;
 		}
 	}
 }
@@ -422,6 +443,22 @@ int ceph_crypt_buflen(const struct ceph_crypto_key *key, int data_len)
 		return AES_BLOCK_SIZE + data_len + 24;
 	default:
 		BUG();
+	}
+}
+
+int ceph_hmac_sha256(const struct ceph_crypto_key *key, const void *buf,
+		     int buf_len, u8 *hmac)
+{
+	switch (key->type) {
+	case CEPH_CRYPTO_NONE:
+		memset(hmac, 0, SHA256_DIGEST_SIZE);
+		return 0;
+	case CEPH_CRYPTO_AES:
+	case CEPH_CRYPTO_AES256KRB5:
+		return crypto_shash_tfm_digest(key->hmac_tfm, buf, buf_len,
+					       hmac);
+	default:
+		return -ENOTSUPP;
 	}
 }
 
