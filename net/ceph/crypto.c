@@ -86,7 +86,6 @@ static int set_secret(struct ceph_crypto_key *key, void *buf)
 	switch (key->type) {
 	case CEPH_CRYPTO_NONE:
 		return 0; /* nothing to do */
-	case CEPH_CRYPTO_AES:
 	case CEPH_CRYPTO_AES256KRB5:
 		break;
 	default:
